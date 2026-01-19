@@ -21,8 +21,15 @@ int main() {
     signal(SIGINT, handle_sigint);
 
     // Open camera
-    int fd = open_camera("/dev/video0");
-    if(fd < 0) return 1;
+    // Use /dev/video4 (ISP-processed path) instead of /dev/video0 (RAW path)
+    // /dev/video4 supports YUYV and other processed formats via the ISP
+    // /dev/video0 only supports RAW Bayer formats
+    int fd = open_camera("/dev/video4");
+    if(fd < 0) {
+        fprintf(stderr, "Failed to open /dev/video4, trying /dev/video0 as fallback\n");
+        fd = open_camera("/dev/video0");
+        if(fd < 0) return 1;
+    }
 
     // Configure resolution & format
     if(configure_camera(fd, WIDTH, HEIGHT) < 0) {
