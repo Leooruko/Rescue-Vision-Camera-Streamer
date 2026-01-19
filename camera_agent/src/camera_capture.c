@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <linux/videodev2.h>
 #include <string.h>
+#include <errno.h>
 
 int open_camera(const char *device) {
     int fd = open(device, O_RDWR);
@@ -54,6 +55,14 @@ int configure_camera(int fd, int width, int height) {
 }
 
 int init_mmap(int fd, CameraBuffer **buffers, int *num_buffers) {
+    // Save current format before requesting buffers (some drivers reset it)
+    struct v4l2_format saved_fmt = {0};
+    saved_fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if(ioctl(fd, VIDIOC_G_FMT, &saved_fmt) < 0) {
+        perror("Failed to get format before buffer allocation");
+        return -1;
+    }
+    
     // First, free any existing buffers (set count to 0)
     struct v4l2_requestbuffers req_free = {0};
     req_free.count = 0;
@@ -70,6 +79,12 @@ int init_mmap(int fd, CameraBuffer **buffers, int *num_buffers) {
     if(ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
         perror("Failed to request buffers");
         return -1;
+    }
+    
+    // Re-set format after requesting buffers (some drivers reset it)
+    if(ioctl(fd, VIDIOC_S_FMT, &saved_fmt) < 0) {
+        perror("Failed to re-set format after buffer allocation");
+        // Continue anyway, format might still be correct
     }
     
     if(req.count == 0) {
@@ -106,20 +121,47 @@ int init_mmap(int fd, CameraBuffer **buffers, int *num_buffers) {
             return -1;
         }
 
-        // Queue the buffer
+        // Queue the buffer - use the struct as returned by QUERYBUF (preserves driver-set fields)
+        // Only ensure type, memory, and index are set (they should already be from QUERYBUF)
         if(ioctl(fd, VIDIOC_QBUF, &buf) < 0) {
             perror("Failed to queue buffer");
+            fprintf(stderr, "Failed to queue buffer %d\n", i);
             return -1;
         }
     }
     
     printf("Successfully allocated and queued %d buffers\n", req.count);
+    
+    // Verify format is correct after buffer allocation
+    struct v4l2_format fmt_check = {0};
+    fmt_check.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if(ioctl(fd, VIDIOC_G_FMT, &fmt_check) == 0) {
+        if(fmt_check.fmt.pix.pixelformat != saved_fmt.fmt.pix.pixelformat ||
+           fmt_check.fmt.pix.width != saved_fmt.fmt.pix.width ||
+           fmt_check.fmt.pix.height != saved_fmt.fmt.pix.height) {
+            fprintf(stderr, "Warning: Format changed after buffer allocation\n");
+            fprintf(stderr, "  Expected: %dx%d, format=0x%08x\n", 
+                    saved_fmt.fmt.pix.width, saved_fmt.fmt.pix.height, saved_fmt.fmt.pix.pixelformat);
+            fprintf(stderr, "  Actual: %dx%d, format=0x%08x\n",
+                    fmt_check.fmt.pix.width, fmt_check.fmt.pix.height, fmt_check.fmt.pix.pixelformat);
+        }
+    }
 
     // Start streaming
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if(ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
         perror("Failed to start streaming");
+        fprintf(stderr, "Error code: %d (EINVAL=%d)\n", errno, EINVAL);
         fprintf(stderr, "Make sure buffers are properly queued and format is set correctly\n");
+        
+        // Try to get more info - check if format is still valid
+        struct v4l2_format fmt_debug = {0};
+        fmt_debug.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if(ioctl(fd, VIDIOC_G_FMT, &fmt_debug) == 0) {
+            fprintf(stderr, "Current format: %dx%d, pixelformat=0x%08x (YUYV=0x%08x)\n",
+                    fmt_debug.fmt.pix.width, fmt_debug.fmt.pix.height,
+                    fmt_debug.fmt.pix.pixelformat, V4L2_PIX_FMT_YUYV);
+        }
         return -1;
     }
     
